@@ -91,85 +91,183 @@ class ResourceTracker(_ResourceTracker):
         self.ensure_running()
         self._send("MAYBE_UNLINK", name, rtype)
 
-    def ensure_running(self):
-        """Make sure that resource tracker process is running.
 
-        This can be run from any process.  Usually a child process will use
-        the resource created by its parent."""
-        with self._lock:
-            if self._fd is not None:
-                # resource tracker was launched before, is it still running?
-                if self._check_alive():
-                    # => still alive
-                    return
-                # => dead, launch it again
-                os.close(self._fd)
-                if os.name == "posix":
-                    try:
-                        # At this point, the resource_tracker process has been
-                        # killed or crashed. Let's remove the process entry
-                        # from the process table to avoid zombie processes.
-                        os.waitpid(self._pid, 0)
-                    except OSError:
-                        # The process was terminated or is a child from an
-                        # ancestor of the current process.
-                        pass
-                self._fd = None
-                self._pid = None
+    def _teardown_dead_process(self):
+        os.close(self._fd)
 
-                warnings.warn(
-                    "resource_tracker: process died unexpectedly, "
-                    "relaunching.  Some folders/sempahores might "
-                    "leak."
-                )
+        # Clean-up to avoid dangling processes.
+        try:
+            # _pid can be None if this process is a child from another
+            # python process, which has started the resource_tracker.
+            if self._pid is not None:
+                os.waitpid(self._pid, 0)
+        except ChildProcessError:
+            # The resource_tracker has already been terminated.
+            pass
+        self._fd = None
+        self._pid = None
+        self._exitcode = None
 
-            fds_to_pass = []
+        warnings.warn('resource_tracker: process died unexpectedly, '
+                      'relaunching.  Some resources might leak.')
+
+    def _launch(self):
+        print('my _launch')
+        fds_to_pass = []
+        try:
+            fds_to_pass.append(sys.stderr.fileno())
+        except Exception:
+            pass
+        r, w = os.pipe()
+
+        cmd = f"from {main.__module__} import main; main({r}, {VERBOSE})"
+        try:
+            fds_to_pass.append(r)
+            # process will out live us, so no need to wait on pid
+            exe = spawn.get_executable()
+            args = [exe, *util._args_from_interpreter_flags(), "-c", cmd]
+            util.debug(f"launching resource tracker: {args}")
+            # bpo-33613: Register a signal mask that will block the
+            # signals.  This signal mask will be inherited by the child
+            # that is going to be spawned and will protect the child from a
+            # race condition that can make the child die before it
+            # registers signal handlers for SIGINT and SIGTERM. The mask is
+            # unregistered after spawning the child.
             try:
-                fds_to_pass.append(sys.stderr.fileno())
-            except Exception:
-                pass
-
-            r, w = os.pipe()
-            if sys.platform == "win32":
-                _r = duplicate(msvcrt.get_osfhandle(r), inheritable=True)
-                os.close(r)
-                r = _r
-
-            cmd = f"from {main.__module__} import main; main({r}, {VERBOSE})"
-            try:
-                fds_to_pass.append(r)
-                # process will out live us, so no need to wait on pid
-                exe = spawn.get_executable()
-                args = [exe, *util._args_from_interpreter_flags(), "-c", cmd]
-                util.debug(f"launching resource tracker: {args}")
-                # bpo-33613: Register a signal mask that will block the
-                # signals.  This signal mask will be inherited by the child
-                # that is going to be spawned and will protect the child from a
-                # race condition that can make the child die before it
-                # registers signal handlers for SIGINT and SIGTERM. The mask is
-                # unregistered after spawning the child.
-                try:
-                    if _HAVE_SIGMASK:
-                        signal.pthread_sigmask(
-                            signal.SIG_BLOCK, _IGNORED_SIGNALS
-                        )
-                    pid = spawnv_passfds(exe, args, fds_to_pass)
-                finally:
-                    if _HAVE_SIGMASK:
-                        signal.pthread_sigmask(
-                            signal.SIG_UNBLOCK, _IGNORED_SIGNALS
-                        )
-            except BaseException:
-                os.close(w)
-                raise
-            else:
-                self._fd = w
-                self._pid = pid
+                if _HAVE_SIGMASK:
+                    signal.pthread_sigmask(
+                        signal.SIG_BLOCK, _IGNORED_SIGNALS
+                    )
+                pid = spawnv_passfds(exe, args, fds_to_pass)
             finally:
-                if sys.platform == "win32":
-                    _winapi.CloseHandle(r)
-                else:
-                    os.close(r)
+                if _HAVE_SIGMASK:
+                    signal.pthread_sigmask(
+                        signal.SIG_UNBLOCK, _IGNORED_SIGNALS
+                    )
+        except BaseException:
+            os.close(w)
+            raise
+        else:
+            self._fd = w
+            self._pid = pid
+        finally:
+            if sys.platform == "win32":
+                _winapi.CloseHandle(r)
+            else:
+                os.close(r)
+        # try:
+        #     fds_to_pass.append(r)
+        #     # process will out live us, so no need to wait on pid
+        #     exe = spawn.get_executable()
+        #     args = [
+        #         exe,
+        #         *util._args_from_interpreter_flags(),
+        #         '-c',
+        #         f'from multiprocessing.resource_tracker import main;main({r})',
+        #     ]
+        #     # bpo-33613: Register a signal mask that will block the signals.
+        #     # This signal mask will be inherited by the child that is going
+        #     # to be spawned and will protect the child from a race condition
+        #     # that can make the child die before it registers signal handlers
+        #     # for SIGINT and SIGTERM. The mask is unregistered after spawning
+        #     # the child.
+        #     prev_sigmask = None
+        #     try:
+        #         if _HAVE_SIGMASK:
+        #             prev_sigmask = signal.pthread_sigmask(signal.SIG_BLOCK, _IGNORED_SIGNALS)
+        #         pid = spawnv_passfds(exe, args, fds_to_pass)
+        #     finally:
+        #         if prev_sigmask is not None:
+        #             signal.pthread_sigmask(signal.SIG_SETMASK, prev_sigmask)
+        # except:
+        #     os.close(w)
+        #     raise
+        # else:
+        #     self._fd = w
+        #     self._pid = pid
+        # finally:
+        #     os.close(r)
+
+
+    # def ensure_running(self):
+    #     """Make sure that resource tracker process is running.
+
+    #     This can be run from any process.  Usually a child process will use
+    #     the resource created by its parent."""
+    #     with self._lock:
+    #         if self._fd is not None:
+    #             # resource tracker was launched before, is it still running?
+    #             if self._check_alive():
+    #                 # => still alive
+    #                 return
+    #             # => dead, launch it again
+    #             os.close(self._fd)
+    #             if os.name == "posix":
+    #                 try:
+    #                     # At this point, the resource_tracker process has been
+    #                     # killed or crashed. Let's remove the process entry
+    #                     # from the process table to avoid zombie processes.
+    #                     os.waitpid(self._pid, 0)
+    #                 except OSError:
+    #                     # The process was terminated or is a child from an
+    #                     # ancestor of the current process.
+    #                     pass
+    #             self._fd = None
+    #             self._pid = None
+
+    #             warnings.warn(
+    #                 "resource_tracker: process died unexpectedly, "
+    #                 "relaunching.  Some folders/sempahores might "
+    #                 "leak."
+    #             )
+
+    #         fds_to_pass = []
+    #         try:
+    #             fds_to_pass.append(sys.stderr.fileno())
+    #         except Exception:
+    #             pass
+
+    #         r, w = os.pipe()
+    #         if sys.platform == "win32":
+    #             _r = duplicate(msvcrt.get_osfhandle(r), inheritable=True)
+    #             os.close(r)
+    #             r = _r
+
+    #         cmd = f"from {main.__module__} import main; main({r}, {VERBOSE})"
+    #         try:
+    #             fds_to_pass.append(r)
+    #             # process will out live us, so no need to wait on pid
+    #             exe = spawn.get_executable()
+    #             args = [exe, *util._args_from_interpreter_flags(), "-c", cmd]
+    #             util.debug(f"launching resource tracker: {args}")
+    #             # bpo-33613: Register a signal mask that will block the
+    #             # signals.  This signal mask will be inherited by the child
+    #             # that is going to be spawned and will protect the child from a
+    #             # race condition that can make the child die before it
+    #             # registers signal handlers for SIGINT and SIGTERM. The mask is
+    #             # unregistered after spawning the child.
+    #             try:
+    #                 if _HAVE_SIGMASK:
+    #                     signal.pthread_sigmask(
+    #                         signal.SIG_BLOCK, _IGNORED_SIGNALS
+    #                     )
+    #                 pid = spawnv_passfds(exe, args, fds_to_pass)
+    #             finally:
+    #                 if _HAVE_SIGMASK:
+    #                     signal.pthread_sigmask(
+    #                         signal.SIG_UNBLOCK, _IGNORED_SIGNALS
+    #                     )
+    #         except BaseException:
+    #             os.close(w)
+    #             raise
+    #         else:
+    #             self._fd = w
+    #             self._pid = pid
+    #         finally:
+    #             if sys.platform == "win32":
+    #                 _winapi.CloseHandle(r)
+    #             else:
+    #                 os.close(r)
 
     def __del__(self):
         # ignore error due to trying to clean up child process which has already been
@@ -182,6 +280,8 @@ class ResourceTracker(_ResourceTracker):
         except ChildProcessError:
             pass
 
+    def register(self, name, rtype):
+        super().register(name, rtype)
 
 _resource_tracker = ResourceTracker()
 ensure_running = _resource_tracker.ensure_running
@@ -193,6 +293,7 @@ getfd = _resource_tracker.getfd
 
 def main(fd, verbose=0):
     """Run resource tracker."""
+    print('my main')
     # protect the process from ^C and "killall python" etc
     if verbose:
         util.log_to_stderr(level=util.DEBUG)
