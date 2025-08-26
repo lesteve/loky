@@ -68,6 +68,7 @@ if os.name == "posix":
     _CLEANUP_FUNCS["semlock"] = sem_unlink
 
 
+# VERBOSE = True
 VERBOSE = False
 
 
@@ -112,7 +113,6 @@ class ResourceTracker(_ResourceTracker):
                       'relaunching.  Some resources might leak.')
 
     def _launch(self):
-        print('my _launch')
         fds_to_pass = []
         try:
             fds_to_pass.append(sys.stderr.fileno())
@@ -293,7 +293,6 @@ getfd = _resource_tracker.getfd
 
 def main(fd, verbose=0):
     """Run resource tracker."""
-    print('my main')
     # protect the process from ^C and "killall python" etc
     if verbose:
         util.log_to_stderr(level=util.DEBUG)
